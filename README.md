@@ -9,6 +9,8 @@
 ```
 uv sync                          # 파이썬 3.15, 가상 환경, 개발 도구를 한 번에 준비
 uv run python -m lwredis         # 입력 루프
+uv run python -m lwredis serve   # TCP 서버 (127.0.0.1:6380, `nc 127.0.0.1 6380`으로 접속)
+uv run python -m lwredis serve 1000   # 키를 1000개까지만 두는 서버 (넘으면 가장 오래 쓰지 않은 키부터 지운다)
 uv run pytest                    # 테스트
 uv run python -m bench.measure   # 성능 그래프
 ```
@@ -21,9 +23,53 @@ uv run python -m bench.measure   # 성능 그래프
 코드는 `src/lwredis/`에 있다.
 `uv sync`는 이 폴더를 가리키는 연결만 설치하므로, 코드를 고친 뒤에 다시 설치할 필요가 없다.
 
-지금은 모든 함수가 `NotImplementedError`를 일으킨다.
-테스트 파일에는 무엇을 작성할지에 대한 설명만 있다.
-그래서 누군가 테스트를 쓰기 전까지 `pytest`는 테스트 0개를 보고한다.
+입력 루프와 서버는 성공한 쓰기 명령을 실행한 폴더의 `lwredis.aof`에 기록하고, 다음에 시작할 때 이 파일을 재실행해 내용을 되살린다.
+
+## 명령이 처리되는 순서
+
+1. `repl.main` 또는 `server.serve`가 한 줄을 읽어 `AOF.run`에 넘긴다.
+2. `AOF.run`이 `dispatch.execute`를 부르고, 성공한 쓰기 명령이면 파일에 한 줄을 남긴다.
+3. `execute`가 줄을 공백으로 나누고, 첫 단어로 `COMMANDS`에서 처리 함수를 찾아 부른다.
+4. `commands/`의 처리 함수가 인자를 검사하고 `Store`에서 값을 꺼내거나 저장한다.
+5. `Store`가 만료 검사(`Expiry`)와 접근 기록(`LRU`)을 거쳐 `HashTable`을 읽고 쓴다.
+6. 처리 함수가 응답 문자열을 돌려주고, `CommandError`가 나면 `execute`가 에러 응답으로 바꾼다.
+
+## 응답 형식
+
+| 경우 | 응답 |
+|---|---|
+| `SET` 성공 | `OK` |
+| 값 하나 (`GET`, `LPOP`, `RPOP`, `ZSCORE`, `ZRANK`) | 값 그대로, 없으면 `(nil)` |
+| 했는지 여부 (`DEL`, `EXISTS`, `EXPIRE`, `PERSIST`, `ZADD`, `ZREM`) | `1` 또는 `0` |
+| 길이 (`LPUSH`, `RPUSH`, `LLEN`) | 숫자 |
+| 여러 값 (`LRANGE`, `ZRANGE`) | 공백으로 이어 붙인 한 줄, 하나도 없으면 `(empty)` |
+| `TTL` | 남은 초, 만료 시각이 없으면 `-1`, 없는 키면 `-2` |
+| 에러 | `ERR `로 시작하는 한 줄 |
+
+인자가 모자라면 에러이고, 남는 인자는 무시한다.
+
+## 파이썬 코드에서 쓰기
+
+서버를 먼저 띄운 뒤, 파이썬 코드에서 `Client`로 한 번 접속하고 그 접속을 계속 쓴다.
+
+```python
+from lwredis.client import Client
+
+client = Client()                 # 127.0.0.1:6380에 접속한다
+
+@client.cache(ttl=60)             # 결과를 서버에 60초 동안 저장한다
+def find_user(user_id):
+    return {"id": user_id, "name": load_name(user_id)}
+
+find_user(7)                      # 함수를 실행하고 결과를 서버에 저장한다
+find_user(7)                      # 함수를 실행하지 않고 서버에 저장된 값을 돌려준다
+client.command("LPUSH jobs a")    # 명령을 직접 보낼 수도 있다
+```
+
+- `ttl`은 저장한 값이 사라지기까지의 초이다. 생략하면 사라지지 않는다.
+- 키 개수 한도는 데코레이터가 아니라 서버를 띄울 때 정한다(`serve 1000`). 서버가 모든 키를 하나의 LRU 기록으로 관리하기 때문이다.
+- 인자와 결과는 JSON으로 바꿀 수 있는 값(숫자, 문자열, 리스트, dict, True/False, None)이어야 한다.
+- 저장되는 키는 `find_user.key(7)`로 확인할 수 있다. `client.command(f"DEL {find_user.key(7)}")`로 저장된 값 하나를 지운다.
 
 ## 구조
 
@@ -42,6 +88,7 @@ src/
     lru.py             LRU 축출 기록
     aof.py             쓰기 명령 로그와 재실행
     server.py          TCP 서버
+    client.py          서버에 접속하는 클라이언트와 캐시 데코레이터
     commands/
       keys.py          SET GET DEL EXISTS EXPIRE TTL PERSIST
       lists.py         LPUSH RPUSH LPOP RPOP LLEN LRANGE
@@ -55,7 +102,7 @@ bench/
   measure.py           성능 측정과 그래프
 tests/
   conftest.py          고정 시드 rng
-  test_*.py            작성할 검증의 설명
+  test_*.py            단계별 검증
 ```
 
 아래 표의 구현 파일은 `bench/measure`를 빼고 모두 `src/lwredis/` 아래에 있다.
@@ -81,4 +128,4 @@ tests/
 
 - `structures/`의 메서드 이름은 제안이다. 세 사람이 2단계 전에 확정한다.
 - `execute`는 저장소를 첫 인자로 받는다. AOF 테스트에서 저장소 두 개를 나란히 돌리기 위해서이다.
-- 응답 문자열의 형식은 아직 정하지 않았다. 예를 들어 없는 키에 `GET`을 하면 무엇을 돌려줄지 정해야 한다.
+- 응답 문자열의 형식은 위의 "응답 형식" 표대로 구현했다. 바꾸려면 `commands/__init__.py`의 `NIL`, `EMPTY`와 `dispatch.py`의 `ERROR_PREFIX`를 고친다.
